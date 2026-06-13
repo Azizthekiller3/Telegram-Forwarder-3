@@ -497,7 +497,7 @@ async def _login2_success(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         + "Use /menu to get started.",
         parse_mode="Markdown",
-        reply_markup=main_menu_keyboard(userbot_ready=ready1),
+        reply_markup=main_menu_keyboard(userbot_ready=ready1, userbot2_ready=True),
     )
     return ConversationHandler.END
 
