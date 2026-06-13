@@ -1,11 +1,14 @@
 """
-/dualcopy — Dual-bot parallel copy handler.
+/dualcopy  — Dual-bot parallel copy handler.
+/stopdual  — Cancel the running dual-copy job.
+/status2   — Per-bot live progress breakdown (Bot 1 vs Bot 2 side-by-side).
 
 Both Telethon userbots work simultaneously:
   • Bot 1 copies the first half of message IDs
   • Bot 2 copies the second half of message IDs
   • A shared asyncio.Lock + shared checkpoint keeps deduplication safe
   • Progress is reported in a single Telegram message, updated periodically
+  • /status2 reads per-bot stats stored in bot_data for a side-by-side view
 """
 from __future__ import annotations
 
@@ -17,7 +20,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 import userbot_bridge as bridge
-from userbot.dual_forwarder import copy_channel_files_dual
+from userbot.dual_forwarder import copy_channel_files_dual, DUAL_STATUS_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +212,7 @@ async def _run_dual_copy(
             caption_replacement = caption_replacement,
             skip_text           = skip_text,
             progress_cb         = _progress,
+            bot_data            = bot_data,
         )
     except asyncio.CancelledError:
         await _progress(
@@ -246,3 +250,134 @@ async def stopdual_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Progress was saved automatically — use /dualcopy again to resume.",
         parse_mode="Markdown",
     )
+
+
+# ─── /status2 ─────────────────────────────────────────────────────────────────
+
+def _rate_str(copied: int, elapsed: float) -> str:
+    """Return a human-readable copy rate string."""
+    if elapsed < 1 or copied == 0:
+        return "—"
+    rate = copied / elapsed
+    if rate >= 1:
+        return f"{rate:.1f} msg/s"
+    return f"{rate * 60:.1f} msg/min"
+
+
+def _eta_str(remaining: int, copied: int, elapsed: float) -> str:
+    if copied == 0 or elapsed < 1:
+        return "?"
+    rate = copied / elapsed
+    secs = int(remaining / rate)
+    m, s = divmod(secs, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _mini_bar(done: int, total: int, width: int = 10) -> str:
+    pct = min(100, int(done / max(total, 1) * 100))
+    filled = pct * width // 100
+    return "█" * filled + "░" * (width - filled)
+
+
+async def status2_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /status2 — Show live per-bot progress for the running dual-copy job.
+
+    Displays Bot 1 and Bot 2 side-by-side with:
+      • Individual copy counts and rates
+      • Each bot's progress through its assigned range
+      • ETA per bot and combined ETA
+    """
+    status = context.bot_data.get(DUAL_STATUS_KEY)
+
+    if not status:
+        task = context.bot_data.get(_DUAL_TASK_KEY)
+        if task and not task.done():
+            await update.message.reply_text(
+                "⚡ *Dual-copy is starting up…*\n\n"
+                "Stats will be available in a moment. Try again in a few seconds.",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                "ℹ️ No dual-copy job is currently running.\n\n"
+                "Use /dualcopy to start one.",
+            )
+        return
+
+    now        = time.time()
+    src        = status["source_name"]
+    dst        = status["dest_name"]
+    total      = status["total"]
+    started_at = status["started_at"]
+    elapsed    = now - started_at
+    shared     = status["shared"]
+    b1         = status["bot1"]
+    b2         = status["bot2"]
+
+    # ── per-bot metrics ───────────────────────────────────────────────────────
+    def _bot_block(label: str, s: dict) -> str:
+        assigned  = s["total_assigned"]
+        copied    = s["copied"]
+        skipped   = s["skipped"]
+        failed    = s["failed"]
+        done      = s.get("done", False)
+        processed = copied + skipped + failed
+        remaining = max(0, assigned - processed)
+
+        bar       = _mini_bar(processed, assigned)
+        pct       = min(100, int(processed / max(assigned, 1) * 100))
+        rate      = _rate_str(copied, elapsed)
+        eta       = "✅ done" if done else _eta_str(remaining, copied, elapsed)
+
+        status_icon = "✅" if done else "⚡"
+        return (
+            f"{status_icon} *{label}*\n"
+            f"`[{bar}]` {pct}%\n"
+            f"✅ `{copied:,}`  ⏭ `{skipped:,}`  ❌ `{failed:,}`\n"
+            f"📦 Assigned: `{assigned:,}` msgs\n"
+            f"🚀 Rate: `{rate}`  •  🏁 ETA: `{eta}`"
+        )
+
+    b1_block = _bot_block("Bot 1 (first half)",  b1)
+    b2_block = _bot_block("Bot 2 (second half)", b2)
+
+    # ── combined totals ───────────────────────────────────────────────────────
+    total_copied  = shared["copied"]
+    total_skipped = shared["skipped"]
+    total_failed  = shared["failed"]
+    processed_all = total_copied + total_skipped + total_failed
+    remaining_all = max(0, total - processed_all)
+    overall_pct   = min(100, int(processed_all / max(total, 1) * 100))
+    overall_bar   = _mini_bar(processed_all, total, width=20)
+    overall_rate  = _rate_str(total_copied, elapsed)
+    overall_eta   = _eta_str(remaining_all, total_copied, elapsed)
+
+    elapsed_int   = int(elapsed)
+    e_m, e_s      = divmod(elapsed_int, 60)
+    e_h, e_m      = divmod(e_m, 60)
+    elapsed_str   = (f"{e_h}h {e_m}m {e_s}s" if e_h else
+                     f"{e_m}m {e_s}s"         if e_m else
+                     f"{e_s}s")
+
+    text = (
+        f"📊 *Dual-Copy Status*\n"
+        f"📡 `{src}` → `{dst}`\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{b1_block}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{b2_block}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌐 *Combined*\n"
+        f"`[{overall_bar}]` {overall_pct}%\n"
+        f"✅ `{total_copied:,}`  ⏭ `{total_skipped:,}`  ❌ `{total_failed:,}`  /  `{total:,}` total\n"
+        f"🚀 Rate: `{overall_rate}`  •  🏁 ETA: `{overall_eta}`\n"
+        f"⏱ Elapsed: `{elapsed_str}`"
+    )
+
+    await update.message.reply_text(text, parse_mode="Markdown")

@@ -86,7 +86,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /stopjob — Cancel the running copy job\n\n"
         "*Dual-bot parallel copy (2× speed):*\n"
         "• /login2 — Connect your second Telegram account\n"
-        "• /dualcopy — Copy using both accounts simultaneously (~2× speed)\n\n"
+        "• /dualcopy — Copy using both accounts simultaneously (~2× speed)\n"
+        "• /status2 — Live per-bot progress breakdown (Bot 1 vs Bot 2)\n"
+        "• /stopdual — Cancel the running dual-copy job\n\n"
         "*Important:* The bot must be an admin in destination chats.\n"
         "For /copy and /sync, you only need to be a *member* of the source channel."
     )

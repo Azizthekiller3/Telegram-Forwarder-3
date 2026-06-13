@@ -9,7 +9,8 @@ channel to the same destination simultaneously:
   • Both halves run concurrently as asyncio tasks.
   • A shared asyncio.Lock protects writes to the shared checkpoint so neither
     bot ever copies the same message twice.
-  • A shared stats dict accumulates totals from both halves for progress reporting.
+  • shared_stats accumulates totals from both halves (for the live progress message).
+  • own_stats per bot tracks each bot's individual copy rate (for /status2).
 
 Checkpoint format is identical to the single-bot checkpoint so existing
 checkpoints are forward-compatible (a /copy checkpoint can be resumed by
@@ -32,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 SAVE_EVERY  = 25
 BATCH_SIZE  = 100   # how many IDs to fetch at once with get_messages()
+
+# bot_data keys used by /status2
+DUAL_STATUS_KEY = "dual_copy_status"
 
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
@@ -64,6 +68,7 @@ async def _flush_album(
     state: dict,
     lock: asyncio.Lock,
     shared_stats: dict,
+    own_stats: dict,
     allowed_exts,
     caption_replacement: str,
     skip_text: bool,
@@ -72,6 +77,7 @@ async def _flush_album(
     """
     Send a buffered album group.  All mutable state is passed explicitly so
     there are no closure-over-loop bugs.
+    own_stats is updated without the lock (each bot owns its own dict).
     """
     msgs = album_buf.pop(gid, [])
     if gid in album_order:
@@ -82,9 +88,11 @@ async def _flush_album(
     async with lock:
         if all(m.id in state["copied_ids"] for m in msgs):
             shared_stats["skipped"] += len(msgs)
+            own_stats["skipped"] += len(msgs)
             return
         if not any(matches_filter(m, allowed_exts, skip_text=False) for m in msgs):
             shared_stats["skipped"] += len(msgs)
+            own_stats["skipped"] += len(msgs)
             return
 
     result = await send_album(
@@ -105,6 +113,14 @@ async def _flush_album(
         else:
             shared_stats["skipped"] += len(msgs)
 
+    # own_stats — no lock needed, only this worker writes it
+    if result == "ok":
+        own_stats["copied"] += len(msgs)
+    elif result == "fail":
+        own_stats["failed"] += len(msgs)
+    else:
+        own_stats["skipped"] += len(msgs)
+
 
 # ─── per-bot copy worker ──────────────────────────────────────────────────────
 
@@ -117,6 +133,7 @@ async def _copy_range(
     state: dict,
     lock: asyncio.Lock,
     shared_stats: dict,
+    own_stats: dict,
     allowed_exts,
     caption_replacement: str,
     skip_text: bool,
@@ -128,6 +145,9 @@ async def _copy_range(
     """
     Copy a slice of message IDs using one Telethon client.
     Messages are fetched in batches of BATCH_SIZE for efficiency.
+
+    own_stats is updated exclusively by this worker — no lock required.
+    shared_stats is updated under lock so both workers stay in sync.
     """
     processed = 0
     last_save = time.time()
@@ -142,6 +162,7 @@ async def _copy_range(
         state               = state,
         lock                = lock,
         shared_stats        = shared_stats,
+        own_stats           = own_stats,
         allowed_exts        = allowed_exts,
         caption_replacement = caption_replacement,
         skip_text           = skip_text,
@@ -165,7 +186,6 @@ async def _copy_range(
 
             batch_ids = message_ids[batch_start : batch_start + BATCH_SIZE]
 
-            # Fetch the actual message objects for this batch
             try:
                 batch_messages = await client.get_messages(source_entity, ids=batch_ids)
             except asyncio.CancelledError:
@@ -174,17 +194,17 @@ async def _copy_range(
                 logger.warning(f"{label} get_messages batch failed: {e}")
                 async with lock:
                     shared_stats["failed"] += len(batch_ids)
+                own_stats["failed"] += len(batch_ids)
                 continue
 
-            # Iterate the batch — group albums, send singles
             for message in batch_messages:
                 if stop_event.is_set():
                     break
 
                 if message is None:
-                    # Deleted or inaccessible message — count as skipped
                     async with lock:
                         shared_stats["skipped"] += 1
+                    own_stats["skipped"] += 1
                     processed += 1
                     continue
 
@@ -196,7 +216,6 @@ async def _copy_range(
                         album_order.append(gid)
                     album_buf[gid].append(message)
 
-                    # Flush any other pending album (different grouped_id)
                     for old_gid in list(album_order):
                         if old_gid != gid:
                             await _flush_album(old_gid, **flush_kwargs)
@@ -206,30 +225,28 @@ async def _copy_range(
                     continue
 
                 else:
-                    # Flush any pending albums before this single message
                     for old_gid in list(album_order):
                         await _flush_album(old_gid, **flush_kwargs)
 
-                    # Dedup check
                     async with lock:
                         already = message.id in state["copied_ids"]
 
                     if already:
                         async with lock:
                             shared_stats["skipped"] += 1
+                        own_stats["skipped"] += 1
                         processed += 1
                         await asyncio.sleep(0)
                         continue
 
-                    # Filter check
                     if not matches_filter(message, allowed_exts, skip_text=skip_text):
                         async with lock:
                             shared_stats["skipped"] += 1
+                        own_stats["skipped"] += 1
                         processed += 1
                         await asyncio.sleep(0)
                         continue
 
-                    # Send
                     result = await _do_send(
                         client, dest_entity, message,
                         dry_run=dry_run,
@@ -247,6 +264,14 @@ async def _copy_range(
                         else:
                             shared_stats["failed"] += 1
 
+                    # own_stats — no lock, only this worker writes it
+                    if result == "ok":
+                        own_stats["copied"] += 1
+                    elif result == "skip":
+                        own_stats["skipped"] += 1
+                    else:
+                        own_stats["failed"] += 1
+
                 processed += 1
 
                 now = time.time()
@@ -256,7 +281,7 @@ async def _copy_range(
 
                 await asyncio.sleep(0)
 
-            # End of batch — flush any remaining albums and save
+            # Flush remaining albums at end of batch
             for gid in list(album_order):
                 await _flush_album(gid, **flush_kwargs)
 
@@ -273,15 +298,17 @@ async def _copy_range(
                 async with lock:
                     state["last_msg_id"] = max(state["last_msg_id"], msgs[0].id)
         await _save()
+        own_stats["done"] = True
         raise
 
     except Exception as e:
         logger.exception(f"{label} worker error: {e}")
         await _save()
+        own_stats["done"] = True
         raise
 
-    # Clean exit save
     await _save()
+    own_stats["done"] = True
     logger.info(f"{label} worker done — checkpoint saved")
 
 
@@ -298,12 +325,15 @@ async def copy_channel_files_dual(
     skip_text: bool = False,
     dry_run: bool = False,
     progress_cb: Callable[[str, bool], Awaitable[None]] | None = None,
+    bot_data: dict | None = None,
 ):
     """
     Copy source → dest using two Telethon clients in parallel.
 
     progress_cb(text, force) — async callable called with a status string.
         force=True → always edit immediately (used for start/finish messages).
+    bot_data — if provided, live per-bot stats are stored under DUAL_STATUS_KEY
+        so /status2 can read them at any time.
     """
     # ── resolve entities ─────────────────────────────────────────────────────
     source_entity1 = await client1.get_entity(source)
@@ -350,6 +380,8 @@ async def copy_channel_files_dual(
                 "All messages already copied.",
                 True,
             )
+        if bot_data is not None:
+            bot_data.pop(DUAL_STATUS_KEY, None)
         return
 
     # ── split IDs 50/50 ──────────────────────────────────────────────────────
@@ -374,16 +406,45 @@ async def copy_channel_files_dual(
             True,
         )
 
-    # ── shared primitives ─────────────────────────────────────────────────────
+    # ── shared + per-bot primitives ───────────────────────────────────────────
     lock         = asyncio.Lock()
     stop_event   = asyncio.Event()
+    started_at   = time.time()
+
     shared_stats = {
         "copied":      state.get("copied",      0),
         "skipped":     state.get("skipped",     0),
         "failed":      state.get("failed",      0),
         "flood_waits": state.get("flood_waits", 0),
     }
-    started_at = time.time()
+
+    # Per-bot stats — written exclusively by each worker, no lock needed
+    bot1_stats = {
+        "label":          "Bot 1 (first half)",
+        "total_assigned": len(ids_bot1),
+        "copied":  0, "skipped": 0, "failed": 0,
+        "done":    False,
+        "started_at": started_at,
+    }
+    bot2_stats = {
+        "label":          "Bot 2 (second half)",
+        "total_assigned": len(ids_bot2),
+        "copied":  0, "skipped": 0, "failed": 0,
+        "done":    False,
+        "started_at": started_at,
+    }
+
+    # Store live status in bot_data so /status2 can read it at any time
+    if bot_data is not None:
+        bot_data[DUAL_STATUS_KEY] = {
+            "source_name": source_name,
+            "dest_name":   dest_name,
+            "total":       total,
+            "started_at":  started_at,
+            "shared":      shared_stats,
+            "bot1":        bot1_stats,
+            "bot2":        bot2_stats,
+        }
 
     # ── live progress reporter ────────────────────────────────────────────────
     async def _report_loop():
@@ -402,8 +463,8 @@ async def copy_channel_files_dual(
             eta_secs = int(remaining_msgs / rate) if rate > 0 else 0
             eta_m, eta_s = divmod(eta_secs, 60)
 
-            pct        = min(100, int((copied + skipped) / max(total, 1) * 100))
-            bar        = "█" * (pct // 5) + "░" * (20 - pct // 5)
+            pct = min(100, int((copied + skipped) / max(total, 1) * 100))
+            bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
 
             if progress_cb:
                 await progress_cb(
@@ -416,7 +477,7 @@ async def copy_channel_files_dual(
                     f"📨 Total:   `{total:,}`\n\n"
                     f"⏱ Elapsed: `{mins}m {secs}s`\n"
                     f"🏁 ETA:     `{eta_m}m {eta_s}s`\n\n"
-                    "🤖 Both bots running in parallel…",
+                    "🤖 Both bots running — use /status2 for per-bot breakdown",
                     False,
                 )
 
@@ -440,6 +501,7 @@ async def copy_channel_files_dual(
             source_entity = source_entity1,
             dest_entity   = dest_entity1,
             message_ids   = ids_bot1,
+            own_stats     = bot1_stats,
             **common,
         )
     )
@@ -450,6 +512,7 @@ async def copy_channel_files_dual(
             source_entity = source_entity2,
             dest_entity   = dest_entity2,
             message_ids   = ids_bot2,
+            own_stats     = bot2_stats,
             **common,
         )
     )
@@ -479,6 +542,8 @@ async def copy_channel_files_dual(
             await reporter
         except asyncio.CancelledError:
             pass
+        if bot_data is not None:
+            bot_data.pop(DUAL_STATUS_KEY, None)
 
     # ── done — report summary ─────────────────────────────────────────────────
     copied  = shared_stats["copied"]

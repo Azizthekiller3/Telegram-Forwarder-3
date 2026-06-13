@@ -156,9 +156,10 @@ def build_app(token: str) -> Application:
     for h in copybot_handler.get_extra_handlers():
         app.add_handler(h)
 
-    # /dualcopy command
+    # /dualcopy command and its companions
     app.add_handler(CommandHandler("dualcopy", dualcopy_handler.dualcopy_cmd))
     app.add_handler(CommandHandler("stopdual", dualcopy_handler.stopdual_cmd))
+    app.add_handler(CommandHandler("status2",  dualcopy_handler.status2_cmd))
 
     # Fallback: unknown /commands and plain text outside any conversation
     app.add_handler(MessageHandler(filters.COMMAND, menu_handler.unknown_command))
