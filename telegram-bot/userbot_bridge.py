@@ -170,3 +170,107 @@ def is_locked2(bot_data: dict) -> bool:
 
 def both_ready(bot_data: dict) -> bool:
     return is_ready(bot_data) and is_ready2(bot_data)
+
+
+# ── String-session import ──────────────────────────────────────────────────────
+
+async def import_string_session(session_str: str, slot: int, bot_data: dict):
+    """
+    Import a Telethon string session for slot 1 (Bot 1) or slot 2 (Bot 2).
+
+    Steps:
+      1. Verify the string with a temporary StringSession client (no file I/O).
+      2. Cancel the existing connect-loop task and disconnect the old client
+         so the SQLite file is no longer locked.
+      3. Write the DC + auth-key data to the on-disk SQLiteSession file.
+      4. Start a fresh _connect_loop that will read the updated file and
+         immediately succeed is_user_authorized() → mark ready.
+
+    Returns the Telethon `Me` object so callers can display the account name.
+    Raises ValueError with a user-friendly message on any failure.
+    """
+    if not API_ID or not API_HASH:
+        raise ValueError("TELEGRAM_API_ID / TELEGRAM_API_HASH are not set.")
+
+    session_str = session_str.strip()
+    if not session_str:
+        raise ValueError("Session string is empty.")
+
+    session_path = SESSION_PATH if slot == 1 else SESSION2_PATH
+    task_key     = "_userbot_connect_task"  if slot == 1 else "_userbot2_connect_task"
+    key_client   = "userbot_client"         if slot == 1 else "userbot2_client"
+    key_ready    = "userbot_ready"          if slot == 1 else "userbot2_ready"
+
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession, SQLiteSession
+    except ImportError as e:
+        raise ValueError(f"Telethon is not installed: {e}")
+
+    # ── 1. Verify the string session works ───────────────────────────────────
+    try:
+        str_sess = StringSession(session_str)
+    except Exception as e:
+        raise ValueError(
+            f"Could not decode the string session — it may be corrupt or truncated.\n"
+            f"Details: {e}"
+        )
+
+    tmp_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    try:
+        await tmp_client.connect()
+        if not await tmp_client.is_user_authorized():
+            raise ValueError(
+                "This session string is *not authorized*.\n"
+                "It may have been revoked in Telegram Settings → Devices."
+            )
+        me = await tmp_client.get_me()
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Could not connect with the session string: {e}")
+    finally:
+        try:
+            await tmp_client.disconnect()
+        except Exception:
+            pass
+
+    # ── 2. Cancel old connect-loop task + disconnect old client ──────────────
+    #    This releases the SQLite file lock so we can safely write to it.
+    old_task = bot_data.get(task_key)
+    if old_task and not old_task.done():
+        old_task.cancel()
+        try:
+            await old_task
+        except Exception:
+            pass
+
+    old_client = bot_data.get(key_client)
+    if old_client:
+        try:
+            await old_client.disconnect()
+        except Exception:
+            pass
+    bot_data.pop(key_client, None)
+    bot_data[key_ready] = False
+
+    # ── 3. Write the verified session data to the on-disk SQLite file ─────────
+    os.makedirs(os.path.join(os.path.dirname(__file__), "sessions"), exist_ok=True)
+    try:
+        file_sess = SQLiteSession(session_path)
+        file_sess.set_dc(str_sess.dc_id, str_sess.server_address, str_sess.port)
+        file_sess.auth_key = str_sess.auth_key
+        file_sess.save()
+    except Exception as e:
+        raise ValueError(f"Could not write session file: {e}")
+
+    # ── 4. Start a fresh connect-loop (will read the updated file) ────────────
+    new_task = asyncio.create_task(_connect_loop(bot_data, slot))
+    bot_data[task_key] = new_task
+
+    label = "Userbot" if slot == 1 else "Userbot2"
+    logger.info(
+        f"{label} string-session import complete for "
+        f"{me.first_name} (@{me.username}) — reconnect task started"
+    )
+    return me

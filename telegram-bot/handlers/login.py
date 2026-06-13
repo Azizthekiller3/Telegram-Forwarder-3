@@ -1,22 +1,12 @@
 """
-In-bot Telethon userbot login wizard.
+In-bot Telethon userbot login wizard — Bot 1.
 
-Flow:
-  /login  or  "Connect Userbot" button
-  → type phone number
-  → type OTP (5-digit code)
-  → (if 2FA) type cloud password
-  → userbot bridge marked ready immediately
+Two login methods are offered:
+  A) OTP flow:  /login → phone number → OTP → (2FA) → done
+  B) String session: /login → paste Telethon string session → done
 
-OTP-expired fix
-───────────────
-Telegram expires a phone_code_hash after ~2 minutes, OR sometimes
-invalidates it server-side almost immediately (timing / DC routing
-issue). We ALWAYS pass the hash explicitly to sign_in() so Telethon
-never falls back to a stale cached one. If PhoneCodeExpiredError is
-raised we immediately call send_code_request() again, store the fresh
-hash, and ask the user for the new code — treating the whole thing as
-a silent auto-resend rather than an error.
+Method B is useful when the account is already authenticated elsewhere
+(e.g. another Telethon-based bot) and you want to skip the SMS step.
 """
 from __future__ import annotations
 
@@ -34,10 +24,17 @@ from telegram.ext import (
 )
 
 import userbot_bridge as bridge
-from states import LOGIN_2FA, LOGIN_OTP, LOGIN_PHONE
+from states import LOGIN_2FA, LOGIN_OTP, LOGIN_PHONE, LOGIN_STRING
 
 logger = logging.getLogger(__name__)
 
+# ── keyboards ─────────────────────────────────────────────────────────────────
+
+_METHOD_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📱 Login with OTP",          callback_data="login_method_otp")],
+    [InlineKeyboardButton("📋 Paste String Session",    callback_data="login_method_string")],
+    [InlineKeyboardButton("❌ Cancel",                  callback_data="login_cancel")],
+])
 _RESEND_KB = InlineKeyboardMarkup([
     [InlineKeyboardButton("🔄 Resend code", callback_data="login_resend")],
     [InlineKeyboardButton("❌ Cancel",       callback_data="login_cancel")],
@@ -58,20 +55,6 @@ def _cleanup(context: ContextTypes.DEFAULT_TYPE):
 
 
 def _where_was_code_sent(sent) -> str:
-    """
-    Return a human-readable string telling the user WHERE to find their OTP.
-
-    Telethon's SentCode.type is one of:
-      SentCodeTypeApp        → delivered to the Telegram app (Saved Messages)
-      SentCodeTypeSms        → delivered as an SMS
-      SentCodeTypeCall       → delivered via automated phone call
-      SentCodeTypeFlashCall  → delivered via flash call (caller hangs up, last digits = code)
-      SentCodeTypeMissedCall → delivered via missed call
-      SentCodeTypeEmailCode  → delivered by email
-
-    Knowing this is critical: if it's SentCodeTypeApp the user must open
-    Telegram → Saved Messages, NOT look in Service Notifications.
-    """
     try:
         type_name = type(sent.type).__name__
     except Exception:
@@ -98,7 +81,7 @@ def _where_was_code_sent(sent) -> str:
     return "your Telegram"
 
 
-# ── entry ──────────────────────────────────────────────────────────────────
+# ── entry ──────────────────────────────────────────────────────────────────────
 
 async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -120,7 +103,6 @@ async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     client = bridge.get_client(context.bot_data)
     if client is None:
-        # Distinguish between "API keys not set" and "still connecting"
         api_id   = os.environ.get("TELEGRAM_API_ID",   "")
         api_hash = os.environ.get("TELEGRAM_API_HASH", "")
         if not api_id or not api_hash:
@@ -142,7 +124,26 @@ async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await _reply(
-        "📱 *Userbot Login*\n\n"
+        "🔑 *Userbot Login — Bot 1*\n\n"
+        "Choose how to connect your Telegram account:\n\n"
+        "• 📱 *OTP* — Telegram sends you a code (standard login)\n"
+        "• 📋 *String Session* — paste a session exported from another Telethon app "
+        "(skips the SMS step — handy if the account is already logged in elsewhere)\n\n"
+        "Or just send your phone number to start the OTP flow directly.",
+        parse_mode="Markdown",
+        reply_markup=_METHOD_KB,
+    )
+    return LOGIN_PHONE
+
+
+# ── method choice callbacks ────────────────────────────────────────────────────
+
+async def login_choose_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User tapped '📱 Login with OTP' — show the phone-number prompt."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "📱 *OTP Login — Bot 1*\n\n"
         "Send your phone number with country code:\n"
         "Example: `+12345678901`",
         parse_mode="Markdown",
@@ -151,7 +152,25 @@ async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return LOGIN_PHONE
 
 
-# ── phone number ────────────────────────────────────────────────────────────
+async def login_choose_string(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User tapped '📋 Paste String Session' — show the paste prompt."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "📋 *String Session Import — Bot 1*\n\n"
+        "Paste your Telethon string session below.\n\n"
+        "How to get it from another Telethon bot:\n"
+        "```\nfrom telethon.sessions import StringSession\n"
+        "print(StringSession.save(client.session))\n```\n\n"
+        "The string is long (~400 chars) and starts with `1` or `BQIA…`\n\n"
+        "_Your session will be verified before being saved._",
+        parse_mode="Markdown",
+        reply_markup=_CANCEL_KB,
+    )
+    return LOGIN_STRING
+
+
+# ── phone number ───────────────────────────────────────────────────────────────
 
 async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
@@ -181,7 +200,7 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["login_phone"]         = phone
     context.user_data["login_sent"]          = sent
     context.user_data["login_otp_attempts"]  = 0
-    context.user_data["login_resend_count"]  = 0  # reset on every fresh login
+    context.user_data["login_resend_count"]  = 0
 
     where = _where_was_code_sent(sent)
     await update.message.reply_text(
@@ -194,13 +213,68 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return LOGIN_OTP
 
 
-# ── OTP ─────────────────────────────────────────────────────────────────────
+# ── string session import ──────────────────────────────────────────────────────
+
+async def login_string_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive and import a pasted Telethon string session for Bot 1."""
+    session_str = update.message.text.strip()
+
+    # Basic sanity check — real Telethon strings are at least 100 chars
+    if len(session_str) < 50:
+        await update.message.reply_text(
+            "❌ That doesn't look like a valid string session (too short).\n\n"
+            "Paste the full string — it should be ~400 characters.\n"
+            "Or tap /cancel to exit.",
+            reply_markup=_CANCEL_KB,
+        )
+        return LOGIN_STRING
+
+    status_msg = await update.message.reply_text(
+        "⏳ *Verifying session string…*\n\n"
+        "Connecting to Telegram to confirm it's valid…",
+        parse_mode="Markdown",
+    )
+
+    try:
+        me = await bridge.import_string_session(
+            session_str, slot=1, bot_data=context.bot_data
+        )
+    except ValueError as e:
+        await status_msg.edit_text(
+            f"❌ *Import failed:*\n\n{e}\n\n"
+            "Check the session string and try again, or use /login for OTP login.",
+            parse_mode="Markdown",
+            reply_markup=_CANCEL_KB,
+        )
+        return LOGIN_STRING
+    except Exception as e:
+        logger.exception("login string session import error (Bot 1)")
+        await status_msg.edit_text(
+            f"❌ *Unexpected error:* `{e}`\n\nUse /login to try again.",
+            parse_mode="Markdown",
+            reply_markup=_menu_kb(),
+        )
+        return ConversationHandler.END
+
+    name  = me.first_name or ""
+    uname = f"@{me.username}" if me.username else f"id={me.id}"
+    _cleanup(context)
+
+    from handlers.menu import main_menu_keyboard
+    await status_msg.edit_text(
+        f"✅ *Bot 1 session imported — logged in as {name} ({uname})!*\n\n"
+        "The userbot is reconnecting in the background (takes ~5 s).\n"
+        "All copy/sync features will be active shortly.\n\n"
+        "Use /menu to get started.",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(userbot_ready=False),
+    )
+    return ConversationHandler.END
+
+
+# ── OTP ────────────────────────────────────────────────────────────────────────
 
 async def _do_resend(phone: str, context: ContextTypes.DEFAULT_TYPE) -> tuple[bool, int]:
-    """
-    Request a fresh OTP. Returns (success, flood_wait_seconds).
-    flood_wait_seconds > 0 means Telegram asked us to wait before retrying.
-    """
     client = bridge.get_client(context.bot_data)
     try:
         from telethon.errors import FloodWaitError
@@ -217,7 +291,6 @@ async def _do_resend(phone: str, context: ContextTypes.DEFAULT_TYPE) -> tuple[bo
 
 
 async def login_resend(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """'Resend code' button — get a fresh phone_code_hash and ask again."""
     query = update.callback_query
     await query.answer("Sending new code…")
 
@@ -263,16 +336,9 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             PhoneCodeInvalidError,
             SessionPasswordNeededError,
         )
-
-        # Pass phone_code_hash explicitly so Telethon never uses a stale one.
         await client.sign_in(phone, code, phone_code_hash=sent.phone_code_hash)
 
     except PhoneCodeExpiredError:
-        # ── OTP-EXPIRED FIX ─────────────────────────────────────────────────
-        # Telegram's server marked this hash as expired (codes last ~2 min).
-        # Limit auto-resends: if we've already done 2 auto-resends, the user
-        # is likely entering an old code from Saved Messages — tell them to
-        # scroll to the very bottom and use /login if still stuck.
         resend_count = context.user_data.get("login_resend_count", 0) + 1
         context.user_data["login_resend_count"] = resend_count
 
@@ -307,8 +373,6 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return ConversationHandler.END
 
-        # Show CANCEL only (no Resend button) — tapping Resend again immediately
-        # triggers Telegram's flood-wait rate limit on send_code_request.
         sent  = context.user_data.get("login_sent")
         where = _where_was_code_sent(sent) if sent else "your Telegram"
         await update.message.reply_text(
@@ -360,7 +424,7 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _login_success(update, context)
 
 
-# ── 2FA password ─────────────────────────────────────────────────────────────
+# ── 2FA password ───────────────────────────────────────────────────────────────
 
 async def login_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text.strip()
@@ -390,7 +454,7 @@ async def login_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _login_success(update, context)
 
 
-# ── cancel ───────────────────────────────────────────────────────────────────
+# ── cancel ─────────────────────────────────────────────────────────────────────
 
 async def login_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _cleanup(context)
@@ -409,7 +473,7 @@ async def login_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ── success ──────────────────────────────────────────────────────────────────
+# ── success ────────────────────────────────────────────────────────────────────
 
 async def _login_success(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from handlers.menu import main_menu_keyboard
@@ -426,14 +490,12 @@ async def _login_success(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "All userbot features (copy, sync, history) are now active.\n\n"
         "Use /menu to get started.",
         parse_mode="Markdown",
-        # Pass userbot_ready=True so the menu shows "✅ Userbot Connected"
-        # instead of the stale "🔑 Connect Userbot" label.
         reply_markup=main_menu_keyboard(userbot_ready=True),
     )
     return ConversationHandler.END
 
 
-# ── ConversationHandler builder ──────────────────────────────────────────────
+# ── ConversationHandler builder ────────────────────────────────────────────────
 
 def build_login_conv() -> ConversationHandler:
     return ConversationHandler(
@@ -445,7 +507,9 @@ def build_login_conv() -> ConversationHandler:
         states={
             LOGIN_PHONE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone),
-                CallbackQueryHandler(login_cancel, pattern="^login_cancel$"),
+                CallbackQueryHandler(login_choose_otp,    pattern="^login_method_otp$"),
+                CallbackQueryHandler(login_choose_string, pattern="^login_method_string$"),
+                CallbackQueryHandler(login_cancel,        pattern="^login_cancel$"),
             ],
             LOGIN_OTP: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, login_otp),
@@ -454,6 +518,10 @@ def build_login_conv() -> ConversationHandler:
             ],
             LOGIN_2FA: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, login_2fa),
+                CallbackQueryHandler(login_cancel, pattern="^login_cancel$"),
+            ],
+            LOGIN_STRING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, login_string_session),
                 CallbackQueryHandler(login_cancel, pattern="^login_cancel$"),
             ],
         },

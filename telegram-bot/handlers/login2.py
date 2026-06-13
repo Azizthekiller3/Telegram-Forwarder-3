@@ -1,14 +1,13 @@
 """
 In-bot Telethon userbot login wizard — second account (Bot 2).
 
-Flow:
-  /login2  or  "Connect Userbot 2" button
-  → type phone number
-  → type OTP (5-digit code)
-  → (if 2FA) type cloud password
-  → userbot2 bridge marked ready immediately
+Two login methods are offered:
+  A) OTP flow:  /login2 → phone number → OTP → (2FA) → done
+  B) String session: /login2 → paste Telethon string session → done
 
-Mirrors handlers/login.py but uses bridge.get_client2() and LOGIN2_* states.
+Method B is useful when the account is already authenticated elsewhere
+(e.g. another Telethon-based bot) and you want to skip the SMS step.
+Mirrors handlers/login.py but uses bridge slot 2 and LOGIN2_* states.
 """
 from __future__ import annotations
 
@@ -26,10 +25,17 @@ from telegram.ext import (
 )
 
 import userbot_bridge as bridge
-from states import LOGIN2_2FA, LOGIN2_OTP, LOGIN2_PHONE
+from states import LOGIN2_2FA, LOGIN2_OTP, LOGIN2_PHONE, LOGIN2_STRING
 
 logger = logging.getLogger(__name__)
 
+# ── keyboards ─────────────────────────────────────────────────────────────────
+
+_METHOD_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📱 Login with OTP",          callback_data="login2_method_otp")],
+    [InlineKeyboardButton("📋 Paste String Session",    callback_data="login2_method_string")],
+    [InlineKeyboardButton("❌ Cancel",                  callback_data="login2_cancel")],
+])
 _RESEND_KB = InlineKeyboardMarkup([
     [InlineKeyboardButton("🔄 Resend code", callback_data="login2_resend")],
     [InlineKeyboardButton("❌ Cancel",       callback_data="login2_cancel")],
@@ -73,7 +79,7 @@ def _where_was_code_sent(sent) -> str:
     return "your Telegram"
 
 
-# ── entry ──────────────────────────────────────────────────────────────────
+# ── entry ──────────────────────────────────────────────────────────────────────
 
 async def login2_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -115,8 +121,26 @@ async def login2_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await _reply(
-        "📱 *Userbot 2 Login — Second Account*\n\n"
-        "This is your *second* Telegram account for dual-bot parallel copying.\n\n"
+        "🔑 *Userbot Login — Bot 2 (Second Account)*\n\n"
+        "Choose how to connect your second Telegram account:\n\n"
+        "• 📱 *OTP* — Telegram sends you a code (standard login)\n"
+        "• 📋 *String Session* — paste a session exported from another Telethon app "
+        "(skips the SMS step — ideal if this account is already logged in elsewhere)\n\n"
+        "Or just send your phone number to start the OTP flow directly.",
+        parse_mode="Markdown",
+        reply_markup=_METHOD_KB,
+    )
+    return LOGIN2_PHONE
+
+
+# ── method choice callbacks ────────────────────────────────────────────────────
+
+async def login2_choose_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User tapped '📱 Login with OTP' — show the phone-number prompt."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "📱 *OTP Login — Bot 2*\n\n"
         "Send your phone number with country code:\n"
         "Example: `+12345678901`",
         parse_mode="Markdown",
@@ -125,7 +149,25 @@ async def login2_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return LOGIN2_PHONE
 
 
-# ── phone number ────────────────────────────────────────────────────────────
+async def login2_choose_string(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User tapped '📋 Paste String Session' — show the paste prompt."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "📋 *String Session Import — Bot 2*\n\n"
+        "Paste your Telethon string session below.\n\n"
+        "How to get it from another Telethon bot:\n"
+        "```\nfrom telethon.sessions import StringSession\n"
+        "print(StringSession.save(client.session))\n```\n\n"
+        "The string is long (~400 chars) and starts with `1` or `BQIA…`\n\n"
+        "_Your session will be verified before being saved._",
+        parse_mode="Markdown",
+        reply_markup=_CANCEL_KB,
+    )
+    return LOGIN2_STRING
+
+
+# ── phone number ───────────────────────────────────────────────────────────────
 
 async def login2_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
@@ -168,7 +210,70 @@ async def login2_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return LOGIN2_OTP
 
 
-# ── OTP ─────────────────────────────────────────────────────────────────────
+# ── string session import ──────────────────────────────────────────────────────
+
+async def login2_string_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive and import a pasted Telethon string session for Bot 2."""
+    session_str = update.message.text.strip()
+
+    if len(session_str) < 50:
+        await update.message.reply_text(
+            "❌ That doesn't look like a valid string session (too short).\n\n"
+            "Paste the full string — it should be ~400 characters.\n"
+            "Or tap /cancel to exit.",
+            reply_markup=_CANCEL_KB,
+        )
+        return LOGIN2_STRING
+
+    status_msg = await update.message.reply_text(
+        "⏳ *Verifying session string…*\n\n"
+        "Connecting to Telegram to confirm it's valid…",
+        parse_mode="Markdown",
+    )
+
+    try:
+        me = await bridge.import_string_session(
+            session_str, slot=2, bot_data=context.bot_data
+        )
+    except ValueError as e:
+        await status_msg.edit_text(
+            f"❌ *Import failed:*\n\n{e}\n\n"
+            "Check the session string and try again, or use /login2 for OTP login.",
+            parse_mode="Markdown",
+            reply_markup=_CANCEL_KB,
+        )
+        return LOGIN2_STRING
+    except Exception as e:
+        logger.exception("login2 string session import error")
+        await status_msg.edit_text(
+            f"❌ *Unexpected error:* `{e}`\n\nUse /login2 to try again.",
+            parse_mode="Markdown",
+            reply_markup=_menu_kb(),
+        )
+        return ConversationHandler.END
+
+    name  = me.first_name or ""
+    uname = f"@{me.username}" if me.username else f"id={me.id}"
+    _cleanup(context)
+
+    ready1 = bridge.is_ready(context.bot_data)
+    from handlers.menu import main_menu_keyboard
+    await status_msg.edit_text(
+        f"✅ *Bot 2 session imported — logged in as {name} ({uname})!*\n\n"
+        "The userbot is reconnecting in the background (takes ~5 s).\n"
+        + (
+            "🚀 Once connected, use /dualcopy for ~2× speed parallel copy!\n\n"
+            if ready1 else
+            "⚠️ Bot 1 is not connected yet — use /login to connect it too.\n\n"
+        )
+        + "Use /menu to get started.",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(userbot_ready=ready1),
+    )
+    return ConversationHandler.END
+
+
+# ── OTP ────────────────────────────────────────────────────────────────────────
 
 async def _do_resend2(phone: str, context: ContextTypes.DEFAULT_TYPE) -> tuple[bool, int]:
     client = bridge.get_client2(context.bot_data)
@@ -232,7 +337,6 @@ async def login2_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             PhoneCodeInvalidError,
             SessionPasswordNeededError,
         )
-
         await client.sign_in(phone, code, phone_code_hash=sent.phone_code_hash)
 
     except PhoneCodeExpiredError:
@@ -321,7 +425,7 @@ async def login2_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _login2_success(update, context)
 
 
-# ── 2FA password ─────────────────────────────────────────────────────────────
+# ── 2FA password ───────────────────────────────────────────────────────────────
 
 async def login2_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text.strip()
@@ -351,7 +455,7 @@ async def login2_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _login2_success(update, context)
 
 
-# ── cancel ───────────────────────────────────────────────────────────────────
+# ── cancel ─────────────────────────────────────────────────────────────────────
 
 async def login2_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _cleanup(context)
@@ -370,7 +474,7 @@ async def login2_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ── success ──────────────────────────────────────────────────────────────────
+# ── success ────────────────────────────────────────────────────────────────────
 
 async def _login2_success(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from handlers.menu import main_menu_keyboard
@@ -383,13 +487,12 @@ async def _login2_success(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _cleanup(context)
 
     ready1 = bridge.is_ready(context.bot_data)
-    both   = ready1 and True
 
     await update.message.reply_text(
         f"✅ *Userbot 2 logged in as {name} ({uname})!*\n\n"
         + (
             "🚀 Both userbots are now connected — you can use /dualcopy for 2× speed!\n\n"
-            if both else
+            if ready1 else
             "⚠️ Userbot 1 is not connected yet — use /login to connect it too.\n\n"
         )
         + "Use /menu to get started.",
@@ -399,7 +502,7 @@ async def _login2_success(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ── ConversationHandler builder ──────────────────────────────────────────────
+# ── ConversationHandler builder ────────────────────────────────────────────────
 
 def build_login2_conv() -> ConversationHandler:
     return ConversationHandler(
@@ -411,7 +514,9 @@ def build_login2_conv() -> ConversationHandler:
         states={
             LOGIN2_PHONE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, login2_phone),
-                CallbackQueryHandler(login2_cancel, pattern="^login2_cancel$"),
+                CallbackQueryHandler(login2_choose_otp,    pattern="^login2_method_otp$"),
+                CallbackQueryHandler(login2_choose_string, pattern="^login2_method_string$"),
+                CallbackQueryHandler(login2_cancel,        pattern="^login2_cancel$"),
             ],
             LOGIN2_OTP: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, login2_otp),
@@ -420,6 +525,10 @@ def build_login2_conv() -> ConversationHandler:
             ],
             LOGIN2_2FA: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, login2_2fa),
+                CallbackQueryHandler(login2_cancel, pattern="^login2_cancel$"),
+            ],
+            LOGIN2_STRING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, login2_string_session),
                 CallbackQueryHandler(login2_cancel, pattern="^login2_cancel$"),
             ],
         },

@@ -38,3 +38,7 @@ DUAL_AWAIT_SRC    = 21
 DUAL_AWAIT_DST    = 22
 DUAL_OPTIONS      = 23
 DUAL_AWAIT_REPLACE = 24
+
+# String-session import states (used by handlers/login.py and login2.py)
+LOGIN_STRING  = 25   # Bot 1: waiting for pasted Telethon string session
+LOGIN2_STRING = 26   # Bot 2: waiting for pasted Telethon string session
