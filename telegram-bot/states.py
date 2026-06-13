@@ -32,3 +32,9 @@ PREVIEW_AWAIT_MSG = 17
 LOGIN2_PHONE = 18
 LOGIN2_OTP   = 19
 LOGIN2_2FA   = 20
+
+# Dual-bot copy wizard states (used by handlers/dualcopy.py)
+DUAL_AWAIT_SRC    = 21
+DUAL_AWAIT_DST    = 22
+DUAL_OPTIONS      = 23
+DUAL_AWAIT_REPLACE = 24

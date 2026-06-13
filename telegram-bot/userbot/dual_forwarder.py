@@ -90,7 +90,8 @@ async def _flush_album(
             shared_stats["skipped"] += len(msgs)
             own_stats["skipped"] += len(msgs)
             return
-        if not any(matches_filter(m, allowed_exts, skip_text=False) for m in msgs):
+        # BUG FIX: was hardcoded skip_text=False — must honour caller's skip_text
+        if not any(matches_filter(m, allowed_exts, skip_text=skip_text) for m in msgs):
             shared_stats["skipped"] += len(msgs)
             own_stats["skipped"] += len(msgs)
             return
@@ -458,12 +459,16 @@ async def copy_channel_files_dual(
             elapsed = int(time.time() - started_at)
             mins, secs = divmod(elapsed, 60)
 
-            rate = copied / max(elapsed, 1)
-            remaining_msgs = max(0, total - copied - skipped)
-            eta_secs = int(remaining_msgs / rate) if rate > 0 else 0
+            # BUG FIX: use processing rate (all outcomes) not just copy rate;
+            # also subtract failed from remaining so ETA doesn't count dead msgs
+            processed    = copied + skipped + failed
+            proc_rate    = processed / max(elapsed, 1)
+            remaining_msgs = max(0, total - processed)
+            eta_secs = int(remaining_msgs / proc_rate) if proc_rate > 0 else 0
             eta_m, eta_s = divmod(eta_secs, 60)
+            rate = copied / max(elapsed, 1)  # kept for display (copy throughput)
 
-            pct = min(100, int((copied + skipped) / max(total, 1) * 100))
+            pct = min(100, int(processed / max(total, 1) * 100))
             bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
 
             if progress_cb:

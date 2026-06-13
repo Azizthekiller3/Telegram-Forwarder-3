@@ -135,20 +135,24 @@ def build_app(token: str) -> Application:
     )
 
     # ── Copy / dryrun / sync conversation handler ────────────────────────────
-    copy_conv    = copybot_handler.build_copy_conv()
-    login_conv   = login_handler.build_login_conv()
-    login2_conv  = login2_handler.build_login2_conv()
-    preview_conv = preview_handler.build_preview_conv()
+    copy_conv     = copybot_handler.build_copy_conv()
+    login_conv    = login_handler.build_login_conv()
+    login2_conv   = login2_handler.build_login2_conv()
+    preview_conv  = preview_handler.build_preview_conv()
+    dualcopy_conv = dualcopy_handler.build_dualcopy_conv()
 
-    # preview_conv is first: when in PREVIEW_AWAIT_MSG state any non-command
-    # message goes there before copy_conv or conv can intercept it.
-    # copy_conv, login_conv, and login2_conv are registered BEFORE conv so that
-    # /copy, /dryrun, /sync, /login, /login2 always work even when the user is
-    # stuck in a stale conv state.
+    # Registration order matters:
+    #   preview_conv  — must intercept free-text messages before copy_conv/conv
+    #   copy_conv     — /copy, /dryrun, /sync wizard
+    #   login_conv    — /login wizard
+    #   login2_conv   — /login2 wizard
+    #   dualcopy_conv — /dualcopy wizard (before main conv so it always intercepts)
+    #   conv          — main menu + rules/ignore/history
     app.add_handler(preview_conv)
     app.add_handler(copy_conv)
     app.add_handler(login_conv)
     app.add_handler(login2_conv)
+    app.add_handler(dualcopy_conv)
     app.add_handler(conv)
     app.add_handler(CommandHandler("help", menu_handler.help_cmd))
 
@@ -156,8 +160,7 @@ def build_app(token: str) -> Application:
     for h in copybot_handler.get_extra_handlers():
         app.add_handler(h)
 
-    # /dualcopy command and its companions
-    app.add_handler(CommandHandler("dualcopy", dualcopy_handler.dualcopy_cmd))
+    # /dualcopy companions — standalone, outside the wizard ConversationHandler
     app.add_handler(CommandHandler("stopdual", dualcopy_handler.stopdual_cmd))
     app.add_handler(CommandHandler("status2",  dualcopy_handler.status2_cmd))
 
